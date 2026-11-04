@@ -1,0 +1,659 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub release'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows.yml'
+      - 'scripts/**'
+      - 'src/**'
+      - 'assets/**'
+      - 'installer/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build
+  cancel-in-progress: false
+
+env:
+  AYU_REPO: AyuGram/AyuGramDesktop
+  AYU_SHA: 0f2a31bb420de98f331990432265b131b8d836b5
+  PREPARE_PATH: Telegram/build/prepare/prepare.py
+  REPO_NAME: tdesktop
+  PUBLISH: ${{ (github.event_name == 'push' || inputs.publish) && 'true' || 'false' }}
+
+jobs:
+
+  libs:
+    name: Libraries
+    runs-on: windows-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - name: Remember the start time.
+        shell: bash
+        run: date +%s > "$RUNNER_TEMP/job_start.txt"
+
+      - name: Free up runner disk space.
+        shell: pwsh
+        run: |
+          function Show-Free($label) {
+            Write-Host ("{0}: {1:N1} GB free on C:" -f $label, ((Get-PSDrive C).Free / 1GB))
+          }
+          Show-Free 'before'
+          $targets = @(
+            'C:\Android', 'C:\Miniconda', 'C:\Julia',
+            'C:\Program Files\MongoDB', 'C:\Program Files\MySQL', 'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Amazon', 'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server', 'C:\Program Files (x86)\Google',
+            'C:\Program Files\R', 'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy', 'C:\tools\kotlinc', 'C:\SeleniumWebDrivers'
+          )
+          foreach ($target in $targets) {
+            if (Test-Path $target) {
+              Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+              Write-Host "removed $target"
+            }
+          }
+          Show-Free 'after'
+
+      # Two /MP2 compilers on heavy files exhaust 16 GB RAM (C1060).
+      - name: Extend the pagefile.
+        uses: al-cheb/configure-pagefile-action@v1.3
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: 'C:'
+
+      - name: Prepare directories.
+        run: |
+          if exist D:\ (
+            mkdir D:\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild D:\TBuild
+          ) else (
+            mkdir %userprofile%\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          )
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Clone AyuGram Desktop sources.
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.AYU_REPO }}
+          ref: ${{ env.AYU_SHA }}
+          submodules: recursive
+          persist-credentials: false
+          path: TBuild\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "release" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+          awk 'NF { print $1"="$2 }' $TBUILD/$REPO_NAME/Telegram/build/version >> $GITHUB_ENV
+          git config --global user.email "ci@tsunderegram.local"
+          git config --global user.name "TsundereGram CI"
+          echo "SDK $SDK"
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: Check the target architecture.
+        shell: bash
+        run: |
+          actual=$(env | sed -n 's/^[Pp]latform=//p' | head -1)
+          echo "vcvars set Platform=$actual"
+          [ "$actual" = "x64" ] || { echo "::error::wrong target architecture: ${actual:-<unset>}"; exit 1; }
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # breakpad's dump_syms needs ATL at a legacy VC path Visual Studio dropped.
+      - name: Make ATL available.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          Write-Host "Visual Studio: $vs"
+          function Find-AtlRoot {
+            if ($env:VCToolsInstallDir) {
+              $preferred = Join-Path $env:VCToolsInstallDir 'atlmfc'
+              if (Test-Path (Join-Path $preferred 'include\atlbase.h')) { return $preferred }
+            }
+            $found = Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { return (Split-Path (Split-Path $found.FullName -Parent) -Parent) }
+            return $null
+          }
+          $atlRoot = Find-AtlRoot
+          if (-not $atlRoot) {
+            Write-Host 'ATL is not installed, adding the component.'
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+              'modify', '--installPath', "`"$vs`"", `
+              '--add', 'Microsoft.VisualStudio.Component.VC.ATL', `
+              '--quiet', '--norestart', '--nocache'
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "vs_installer failed with $($p.ExitCode)"; exit 1 }
+            $atlRoot = Find-AtlRoot
+          }
+          if (-not $atlRoot) { Write-Error 'atlbase.h still not found'; exit 1 }
+          Write-Host "ATL root: $atlRoot"
+          $legacy = Join-Path $vs 'VC\atlmfc'
+          $toolset = Join-Path $env:VCToolsInstallDir 'atlmfc'
+          foreach ($link in @($legacy, $toolset)) {
+            if (Test-Path $link) { Write-Host "$link already exists" }
+            else { New-Item -ItemType Junction -Path $link -Target $atlRoot | Out-Null; Write-Host "Linked $link -> $atlRoot" }
+          }
+
+      # actions/cache saves only on success; split restore/save to bank library progress on failure.
+      - name: ThirdParty cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-third-party-
+
+      - name: Libraries cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-libs-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-libs-rel-
+
+      - name: Qt cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-qt-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-qt-rel-
+
+      # A restored cache that lost an artifact still reads as built; drop its key to refetch.
+      - name: Heal stale cache keys.
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          drop() { rm -f "$LibrariesPath"/cache_keys/$1; echo "$2, dropped the $1 cache key"; }
+          [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] || drop tg_angle "ANGLE library missing"
+          [ -f "$LibrariesPath/nv-codec-headers/Makefile" ] || drop nv-codec-headers "nv-codec-headers makefile missing"
+          if [ -z "$(ls -A "$LibrariesPath/local/lib/pkgconfig" 2>/dev/null)" ]; then
+            for lib in dav1d openh264 opus libvpx; do drop $lib "pkg-config files missing"; done
+          fi
+          ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
+          (ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}') > "$RUNNER_TEMP/libs_before.txt"
+
+      - name: Libraries.
+        timeout-minutes: 290
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
+
+      - name: Check what was built.
+        if: always()
+        shell: bash
+        run: |
+          after=$(ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}')
+          before=$(cat "$RUNNER_TEMP/libs_before.txt" 2>/dev/null)
+          ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
+          if [ "$after" != "$before" ]; then echo "LIBS_CHANGED=1" >> $GITHUB_ENV; echo "libraries changed"; else echo "libraries unchanged"; fi
+
+      - name: Free up some disk space.
+        if: always()
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || { echo "nothing to clean up"; exit 0; }
+          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' -o -path '*/gas-preprocessor/*' ')' -type f ')' -o -empty ')' -delete || true
+
+      - name: Save ThirdParty cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Save libraries cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-libs-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Save Qt cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-qt-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+  build:
+    name: TsundereGram Desktop
+    needs: libs
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - name: Remember the start time.
+        shell: bash
+        run: date +%s > "$RUNNER_TEMP/job_start.txt"
+
+      - name: Free up runner disk space.
+        shell: pwsh
+        run: |
+          function Show-Free($label) {
+            Write-Host ("{0}: {1:N1} GB free on C:" -f $label, ((Get-PSDrive C).Free / 1GB))
+          }
+          Show-Free 'before'
+          $targets = @(
+            'C:\Android', 'C:\Miniconda', 'C:\Julia',
+            'C:\Program Files\MongoDB', 'C:\Program Files\MySQL', 'C:\Program Files\PostgreSQL',
+            'C:\Program Files\Amazon', 'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files (x86)\Microsoft SQL Server', 'C:\Program Files (x86)\Google',
+            'C:\Program Files\R', 'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy', 'C:\tools\kotlinc', 'C:\SeleniumWebDrivers'
+          )
+          foreach ($target in $targets) {
+            if (Test-Path $target) {
+              Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+              Write-Host "removed $target"
+            }
+          }
+          Show-Free 'after'
+
+      # Two /MP2 compilers on heavy files exhaust 16 GB RAM (C1060).
+      - name: Extend the pagefile.
+        uses: al-cheb/configure-pagefile-action@v1.3
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: 'C:'
+
+      - name: Prepare directories.
+        run: |
+          if exist D:\ (
+            mkdir D:\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild D:\TBuild
+          ) else (
+            mkdir %userprofile%\TBuild\Libraries
+            mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          )
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Clone AyuGram Desktop sources.
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.AYU_REPO }}
+          ref: ${{ env.AYU_SHA }}
+          submodules: recursive
+          persist-credentials: false
+          path: TBuild\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "release" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+          awk 'NF { print $1"="$2 }' $TBUILD/$REPO_NAME/Telegram/build/version >> $GITHUB_ENV
+          git config --global user.email "ci@tsunderegram.local"
+          git config --global user.name "TsundereGram CI"
+          echo "SDK $SDK"
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: Check the target architecture.
+        shell: bash
+        run: |
+          actual=$(env | sed -n 's/^[Pp]latform=//p' | head -1)
+          echo "vcvars set Platform=$actual"
+          [ "$actual" = "x64" ] || { echo "::error::wrong target architecture: ${actual:-<unset>}"; exit 1; }
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # breakpad's dump_syms needs ATL at a legacy VC path Visual Studio dropped.
+      - name: Make ATL available.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          Write-Host "Visual Studio: $vs"
+          function Find-AtlRoot {
+            if ($env:VCToolsInstallDir) {
+              $preferred = Join-Path $env:VCToolsInstallDir 'atlmfc'
+              if (Test-Path (Join-Path $preferred 'include\atlbase.h')) { return $preferred }
+            }
+            $found = Get-ChildItem "$vs\VC\Tools\MSVC\*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { return (Split-Path (Split-Path $found.FullName -Parent) -Parent) }
+            return $null
+          }
+          $atlRoot = Find-AtlRoot
+          if (-not $atlRoot) {
+            Write-Host 'ATL is not installed, adding the component.'
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+              'modify', '--installPath', "`"$vs`"", `
+              '--add', 'Microsoft.VisualStudio.Component.VC.ATL', `
+              '--quiet', '--norestart', '--nocache'
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Write-Error "vs_installer failed with $($p.ExitCode)"; exit 1 }
+            $atlRoot = Find-AtlRoot
+          }
+          if (-not $atlRoot) { Write-Error 'atlbase.h still not found'; exit 1 }
+          Write-Host "ATL root: $atlRoot"
+          $legacy = Join-Path $vs 'VC\atlmfc'
+          $toolset = Join-Path $env:VCToolsInstallDir 'atlmfc'
+          foreach ($link in @($legacy, $toolset)) {
+            if (Test-Path $link) { Write-Host "$link already exists" }
+            else { New-Item -ItemType Junction -Path $link -Target $atlRoot | Out-Null; Write-Host "Linked $link -> $atlRoot" }
+          }
+
+      # actions/cache saves only on success; split restore/save to bank library progress on failure.
+      - name: ThirdParty cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-third-party-
+
+      - name: Libraries cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-libs-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-libs-rel-
+
+      - name: Qt cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-qt-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-qt-rel-
+
+      # A restored cache that lost an artifact still reads as built; drop its key to refetch.
+      - name: Heal stale cache keys.
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || exit 0
+          drop() { rm -f "$LibrariesPath"/cache_keys/$1; echo "$2, dropped the $1 cache key"; }
+          [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] || drop tg_angle "ANGLE library missing"
+          [ -f "$LibrariesPath/nv-codec-headers/Makefile" ] || drop nv-codec-headers "nv-codec-headers makefile missing"
+          if [ -z "$(ls -A "$LibrariesPath/local/lib/pkgconfig" 2>/dev/null)" ]; then
+            for lib in dav1d openh264 opus libvpx; do drop $lib "pkg-config files missing"; done
+          fi
+          ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
+          (ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}') > "$RUNNER_TEMP/libs_before.txt"
+
+      - name: Libraries.
+        timeout-minutes: 200
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
+
+      - name: Check what was built.
+        if: always()
+        shell: bash
+        run: |
+          after=$(ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}')
+          before=$(cat "$RUNNER_TEMP/libs_before.txt" 2>/dev/null)
+          ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
+          if [ "$after" != "$before" ]; then echo "LIBS_CHANGED=1" >> $GITHUB_ENV; echo "libraries changed"; else echo "libraries unchanged"; fi
+
+      - name: Free up some disk space.
+        if: always()
+        shell: bash
+        run: |
+          [ -d "$LibrariesPath" ] || { echo "nothing to clean up"; exit 0; }
+          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' -o -path '*/gas-preprocessor/*' ')' -type f ')' -o -empty ')' -delete || true
+
+      - name: Save ThirdParty cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Save libraries cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\*
+            !${{ env.LibrariesPath }}\cache_keys
+            !${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\*
+            !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-libs-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Save Qt cache.
+        if: always() && env.LIBS_CHANGED == '1'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.LibrariesPath }}\[qQ]t[_-]*
+            ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
+          key: ${{ runner.os }}-x64-qt-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Clone TsundereGram Desktop (latest).
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          path: tsg
+
+      - name: Build tree cache.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}\out
+          key: ${{ runner.os }}-x64-out-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-x64-out-${{ env.CACHE_KEY }}-
+
+      - name: Apply TsundereGram branding.
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -q pillow
+          python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part freeze
+          python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part branding
+          echo "TSG_SHA=$(git -C tsg rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Apply TsundereGram features.
+        id: features
+        continue-on-error: true
+        shell: bash
+        run: python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part features
+
+      - name: Undo partially applied features.
+        if: steps.features.outcome == 'failure'
+        shell: bash
+        run: python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part revert-features
+
+      - name: Configure.
+        run: call tsg\scripts\configure.bat
+
+      - name: Time budget.
+        shell: bash
+        run: |
+          now=$(date +%s); start=$(cat "$RUNNER_TEMP/job_start.txt")
+          left=$(( 345 - (now - start) / 60 - 30 ))
+          [ $left -lt 20 ] && left=20
+          echo "BUILD_MINUTES=$left" >> $GITHUB_ENV; echo "build budget: $left minutes"
+
+      - name: Build TsundereGram Desktop.
+        id: build1
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(env.BUILD_MINUTES) }}
+        shell: pwsh
+        env:
+          _CL_: /MP2
+        run: tsg\scripts\build.ps1 -Label build1
+
+      - name: Report the failed build.
+        if: steps.build1.outcome != 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tsg/scripts/report.sh build1
+
+      - name: Revert features after a failed build.
+        id: revert
+        if: steps.build1.outcome != 'success' && steps.features.outcome == 'success'
+        shell: bash
+        run: |
+          python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part revert-features
+          now=$(date +%s); start=$(cat "$RUNNER_TEMP/job_start.txt")
+          left=$(( 345 - (now - start) / 60 - 25 ))
+          [ $left -lt 10 ] && left=10
+          echo "BUILD_MINUTES=$left" >> $GITHUB_ENV; echo "fallback budget: $left minutes"
+
+      - name: Build without the new features.
+        id: build2
+        if: steps.revert.outcome == 'success'
+        timeout-minutes: ${{ fromJSON(env.BUILD_MINUTES) }}
+        shell: pwsh
+        env:
+          _CL_: /MP2
+        run: tsg\scripts\build.ps1 -Label build2
+
+      - name: Report the fallback build.
+        if: failure() && steps.build2.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tsg/scripts/report.sh build2
+
+      - name: Write the manifest.
+        if: steps.build1.outcome == 'success' || steps.build2.outcome == 'success'
+        shell: bash
+        run: |
+          python tsg/scripts/apply.py "$TBUILD/$REPO_NAME" --part manifest
+          if [ "${{ steps.build1.outcome }}" = "success" ] && [ "${{ steps.features.outcome }}" = "success" ]; then
+            echo "FEATURES=1" >> $GITHUB_ENV
+          else
+            echo "FEATURES=0" >> $GITHUB_ENV
+          fi
+
+      - name: Save build tree cache.
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.TBUILD }}\${{ env.REPO_NAME }}\out
+            !${{ env.TBUILD }}\${{ env.REPO_NAME }}\out\Release\*.exe
+          key: ${{ runner.os }}-x64-out-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package.
+        shell: pwsh
+        run: |
+          $release = "$env:TBUILD\$env:REPO_NAME\out\Release"
+          $exe = Join-Path $release 'TsundereGram.exe'
+          if (-not (Test-Path $exe)) { Write-Error "TsundereGram.exe is missing"; exit 1 }
+          $deploy = Join-Path $env:GITHUB_WORKSPACE 'deploy'
+          $dir = Join-Path $deploy 'TsundereGram'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item $exe $dir
+          $d3d = Join-Path $release 'modules\x64\d3d\d3dcompiler_47.dll'
+          if (Test-Path $d3d) {
+            $m = Join-Path $dir 'modules\x64\d3d'
+            New-Item -ItemType Directory -Path $m -Force | Out-Null
+            Copy-Item $d3d $m
+          }
+          Set-Location $deploy
+          & 7z a -mx9 TsundereGram-Desktop-x64.zip TsundereGram\
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item "$env:TBUILD\$env:REPO_NAME\Telegram\Resources\art\icon256.ico" "$env:GITHUB_WORKSPACE\tsg\installer\icon.ico"
+          $iscc = Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = Get-ChildItem 'C:\Program Files*\Inno Setup*\ISCC.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($iscc) {
+            & $iscc.FullName "/DMyAppVersion=$env:AppVersionStr" "/DSourceDir=$dir" "/DOutputDir=$deploy" "$env:GITHUB_WORKSPACE\tsg\installer\tsunderegram.iss"
+            if ($LASTEXITCODE -ne 0) { Write-Host 'installer failed' }
+          }
+          Get-ChildItem $deploy | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v7
+        name: Upload the artifacts.
+        with:
+          name: TsundereGram-Desktop-x64-${{ github.run_number }}
+          path: |
+            deploy\*.zip
+            deploy\*.exe
+
+      - name: Publish the release.
+        if: env.PUBLISH == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="desktop-v${AppVersionStr}-${GITHUB_RUN_NUMBER}"
+          if [ "$FEATURES" = "1" ]; then F="все функции TsundereGram включены"; else F="базовая сборка (функции TsundereGram в следующей сборке)"; fi
+          cat > notes.md <<NOTES
+          TsundereGram Desktop ${AppVersionStr} для Windows x64 (на базе AyuGram Desktop / Telegram Desktop).
+
+          - **TsundereGram-Desktop-Setup-x64.exe** — установщик
+          - **TsundereGram-Desktop-x64.zip** — портативная версия (распакуй и запусти TsundereGram.exe)
+
+          Сборка: ${F}. Коммит: ${TSG_SHA}.
+          NOTES
+          FILES=(deploy/TsundereGram-Desktop-x64.zip)
+          [ -f deploy/TsundereGram-Desktop-Setup-x64.exe ] && FILES+=(deploy/TsundereGram-Desktop-Setup-x64.exe)
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "${GITHUB_REF_NAME}" \
+            --title "TsundereGram Desktop ${AppVersionStr} (сборка ${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md --latest "${FILES[@]}"
