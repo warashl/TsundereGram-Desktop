@@ -88,6 +88,12 @@ jobs:
           echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
           echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
 
+      - name: Clone TsundereGram Desktop.
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.job == 'build' && github.ref_name || github.sha }}
+          path: tsg
+
       - name: Clone AyuGram Desktop sources.
         uses: actions/checkout@v7
         with:
@@ -96,6 +102,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
           path: TBuild\${{ env.REPO_NAME }}
+
+      - name: Fix prepare.py for the current MSYS2.
+        shell: bash
+        run: python tsg/scripts/fix_prepare.py "$TBUILD/$REPO_NAME"
 
       - name: First set up.
         shell: bash
@@ -201,6 +211,8 @@ jobs:
       - name: Heal stale cache keys.
         shell: bash
         run: |
+          set +o pipefail
+          echo "empty" > "$RUNNER_TEMP/libs_before.txt"
           [ -d "$LibrariesPath" ] || exit 0
           drop() { rm -f "$LibrariesPath"/cache_keys/$1; echo "$2, dropped the $1 cache key"; }
           [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] || drop tg_angle "ANGLE library missing"
@@ -208,6 +220,7 @@ jobs:
           if [ -z "$(ls -A "$LibrariesPath/local/lib/pkgconfig" 2>/dev/null)" ]; then
             for lib in dav1d openh264 opus libvpx; do drop $lib "pkg-config files missing"; done
           fi
+          set +o pipefail
           ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
           (ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}') > "$RUNNER_TEMP/libs_before.txt"
 
@@ -220,6 +233,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set +o pipefail
           after=$(ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}')
           before=$(cat "$RUNNER_TEMP/libs_before.txt" 2>/dev/null)
           ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
@@ -318,6 +332,12 @@ jobs:
           echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
           echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
 
+      - name: Clone TsundereGram Desktop.
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.job == 'build' && github.ref_name || github.sha }}
+          path: tsg
+
       - name: Clone AyuGram Desktop sources.
         uses: actions/checkout@v7
         with:
@@ -326,6 +346,10 @@ jobs:
           submodules: recursive
           persist-credentials: false
           path: TBuild\${{ env.REPO_NAME }}
+
+      - name: Fix prepare.py for the current MSYS2.
+        shell: bash
+        run: python tsg/scripts/fix_prepare.py "$TBUILD/$REPO_NAME"
 
       - name: First set up.
         shell: bash
@@ -431,6 +455,8 @@ jobs:
       - name: Heal stale cache keys.
         shell: bash
         run: |
+          set +o pipefail
+          echo "empty" > "$RUNNER_TEMP/libs_before.txt"
           [ -d "$LibrariesPath" ] || exit 0
           drop() { rm -f "$LibrariesPath"/cache_keys/$1; echo "$2, dropped the $1 cache key"; }
           [ -f "$LibrariesPath/tg_angle/out/Release/tg_angle.lib" ] || drop tg_angle "ANGLE library missing"
@@ -438,6 +464,7 @@ jobs:
           if [ -z "$(ls -A "$LibrariesPath/local/lib/pkgconfig" 2>/dev/null)" ]; then
             for lib in dav1d openh264 opus libvpx; do drop $lib "pkg-config files missing"; done
           fi
+          set +o pipefail
           ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
           (ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}') > "$RUNNER_TEMP/libs_before.txt"
 
@@ -450,6 +477,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set +o pipefail
           after=$(ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | sha256sum | awk '{print $1}')
           before=$(cat "$RUNNER_TEMP/libs_before.txt" 2>/dev/null)
           ls "$LibrariesPath/cache_keys" 2>/dev/null | sort | tr '\n' ' '; echo
@@ -489,12 +517,6 @@ jobs:
             ${{ env.LibrariesPath }}\[qQ]t[_-]*
             ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
           key: ${{ runner.os }}-x64-qt-rel-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.job }}
-
-      - name: Clone TsundereGram Desktop (latest).
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.ref_name }}
-          path: tsg
 
       - name: Build tree cache.
         uses: actions/cache/restore@v6
