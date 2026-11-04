@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: windows-build
+  group: windows-build-${{ github.event_name }}
   cancel-in-progress: false
 
 env:
